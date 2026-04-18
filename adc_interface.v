@@ -1,0 +1,61 @@
+// ADC接口与位宽转换模块
+// 功能：ADC原始数据转Q4.12定点数，误差信号计算（振动+控制反馈）
+`timescale 1ns / 1ps
+
+module adc_interface(
+    input           sys_clk,
+    input           sys_rst_n,
+    input   [15:0]  adc_data,
+    input           adc_data_valid,
+    input           sample_en,
+	 input   signed [15:0] dac_data,  // 【新增】DAC控制信号输入
+    output  reg signed [15:0] vib_raw,
+    output  reg signed [15:0] error_signal
+);
+
+// 内部信号：控制反馈延迟（匹配次级路径4拍延迟）
+reg signed [15:0]  control_feedback [3:0];
+wire signed [15:0] acc_control; // 作动器控制反馈加速度
+parameter   S_GAIN = 16'sd819; // 次级路径增益-0.2，Q4.12量化值：-0.2*4096 = -819
+
+// 振动信号采样与位宽转换
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        vib_raw <= 16'sd0;
+    end
+    else if(sample_en && adc_data_valid) begin
+        // ADC输入为16位有符号，直接映射为Q4.12格式，匹配±5g量程
+        vib_raw <= $signed(adc_data);
+    end
+end
+
+// 控制反馈延迟链，匹配4拍次级路径延迟
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        control_feedback[0] <= 16'sd0;
+        control_feedback[1] <= 16'sd0;
+        control_feedback[2] <= 16'sd0;
+        control_feedback[3] <= 16'sd0;
+    end
+    else if(sample_en) begin
+        control_feedback[0] <= dac_data; // 从DAC模块回读控制输出
+        control_feedback[1] <= control_feedback[0];
+        control_feedback[2] <= control_feedback[1];
+        control_feedback[3] <= control_feedback[2];
+    end
+end
+
+// 作动器反馈加速度计算：acc_control = s_gain * control_output
+assign acc_control = (control_feedback[3] * S_GAIN) >>> 12; // 右移12位，Q4.12对齐
+
+// 误差信号计算：error = 原始振动 + 控制反馈
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        error_signal <= 16'sd0;
+    end
+    else if(sample_en) begin
+        error_signal <= vib_raw + acc_control;
+    end
+end
+
+endmodule

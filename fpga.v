@@ -1,0 +1,107 @@
+// 精密加工振动主动控制FPGA顶层模块
+// 适配Cyclone V FPGA，Quartus Prime Lite环境
+// 核心算法：FxLMS主动振动控制，支持定步长/变步长切换
+`timescale 1ns / 1ps
+
+module fpga(
+    // 系统时钟与复位
+    input           sys_clk,        // 外部输入50MHz时钟
+    input           sys_rst_n,      // 系统复位，低电平有效
+    // ADC采集接口（振动加速度信号输入）
+    input   [15:0]  adc_data,       // ADC16位并行数据，原始振动信号
+    input           adc_data_valid, // ADC数据有效信号
+    // DAC输出接口（控制信号输出到压电作动器）
+    output  [15:0]  dac_data,       // DAC16位并行数据，控制输出
+    output          dac_data_valid, // DAC数据有效信号
+    // 模式配置接口
+    input           step_mode_sel,  // 步长模式选择：0=定步长，1=变步长
+    input           harm_suppress_en// 谐波抑制使能：0=关闭，1=开启
+);
+
+// ==================== 内部信号定义 ====================
+wire                sys_clk_global;   // PLL输出全局时钟
+wire                pll_locked;       // PLL锁定信号
+wire                sys_rst_n_sync;   // 同步后全局复位
+wire                sample_en;        // 10kHz采样使能信号
+wire signed [15:0]  vib_raw;          // 原始振动信号，Q4.12
+wire signed [15:0]  error_signal;     // 误差信号，Q4.12
+wire signed [15:0]  xf_signal;        // 滤波后参考信号x_f，Q4.12
+wire signed [15:0]  fxlms_output;     // FxLMS线性控制输出，Q4.12
+wire signed [15:0]  harm_output;      // 谐波抑制输出，Q4.12
+wire signed [15:0]  control_total;    // 总控制输出，Q4.12
+
+// ==================== 模块例化 ====================
+// 0. 复位同步模块
+rst_sync u_rst_sync(
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n),
+    .sys_rst_n_sync (sys_rst_n_sync)
+);
+
+// 1. 时钟管理模块：PLL全局时钟+10kHz采样使能
+clk_pll u_clk_pll(
+    .sys_clk_in     (sys_clk),
+    .sys_rst_n      (sys_rst_n),
+    .sys_clk        (sys_clk_global),
+    .pll_locked     (pll_locked),
+    .sample_en      (sample_en)
+);
+
+// 2. ADC接口与位宽转换：原始ADC数据→定点数Q4.12
+adc_interface u_adc_interface(
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .adc_data       (adc_data),
+    .adc_data_valid (adc_data_valid),
+    .sample_en      (sample_en),
+    .dac_data       (control_total),
+    .vib_raw        (vib_raw),
+    .error_signal   (error_signal)
+);
+
+// 3. 次级路径滤波模块：S_hat滤波，生成Filtered-x信号
+s_hat_filter u_s_hat_filter(
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .x_input        (vib_raw),
+    .xf_output      (xf_signal)
+);
+
+// 4. FxLMS核心算法模块
+fxlms_core u_fxlms_core(
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .x_input        (vib_raw),
+    .xf_input       (xf_signal),
+    .error_input    (error_signal),
+    .step_mode_sel  (step_mode_sel),
+    .fxlms_output   (fxlms_output)
+);
+
+// 5. 谐波抑制模块（可选）
+harmonic_suppress u_harmonic_suppress(
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .en             (harm_suppress_en),
+    .current_phase  (vib_raw[15:0]),
+    .error_input    (error_signal),
+    .xf_input       (xf_signal),
+    .harm_output    (harm_output)
+);
+
+// 6. 总控制信号合成 + DAC输出接口
+assign control_total = fxlms_output + harm_output;
+dac_interface u_dac_interface(
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .control_input  (control_total),
+    .dac_data       (dac_data),
+    .dac_data_valid (dac_data_valid)
+);
+
+
+endmodule
