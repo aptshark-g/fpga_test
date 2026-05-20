@@ -138,7 +138,7 @@ classdef HybridController < handle
             obj.current_state = new_state;
             
             if obj.verbose
-                fprintf('状态切换: %s -> %s\n', old_state, new_state);
+                %fprintf('状态切换: %s -> %s\n', old_state, new_state);
             end
             
             switch new_state

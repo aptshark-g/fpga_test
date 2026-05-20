@@ -1,0 +1,426 @@
+% =====================================================================
+% 面向精密加工的振动主动控制仿真主程序 (正交解耦·终极全景版)
+% 实现了 线性底座、非线性架构、融合策略 的完全解耦，支持任意排列组合！
+% =====================================================================
+clear; clc; close all;
+
+%% ==================== 1. 终极三维控制面板 ====================
+
+% 【维度一：非线性架构模式】
+% 1: 纯 FxLMS (无非线性补偿)
+% 2: FxLMS + FLANN+RNN (纯边缘端在线学习，无先验暗知识)
+% 3: FxLMS + 蒸馏 NN (加载 trained_nn.mat，具备相位超前预判)
+MODE = 3;       
+
+% 【维度二：线性底座模式 (FxLMS 步长策略)】
+% 1: 定步长 FxLMS (Fixed Step)
+% 2: 变步长 FxLMS (VSS - 依据残差能量自动伸缩)
+STEP_MODE = 2;  
+
+% 【维度三：端云融合策略】 (仅当 MODE=2 或 3 时生效)
+% 1: 固定微小比例混合 (0.05 强行写死)
+% 2: 动态凸因子 α (零和博弈跷跷板)
+% 3: 动态非对称混合 ρ (梯度自适应) + 窄带谐波刺客 
+MIX_MODE = 2;   
+
+% 【环境工况】
+% 1:多工步突变 2:固定100Hz 3:线性扫频 4:正弦调制
+EM = 1;
+
+% 数据采集
+ta = 0;
+
+% 【维度四：窄带谐波刺客开关】
+% 0: 关闭谐波刺客 (y_harm=0)
+% 1: 开启谐波刺客 (原基准组)
+HARM_SWITCH = 1;  % 做对照实验时仅需改这里为0
+
+%% ==================== 2. 系统与物理环境参数 ====================
+fs = 10000;                 
+dt = 1/fs;                  
+duration = 30;              
+n_samples = duration * fs;
+t = (0:n_samples-1)' / fs;
+vib_freq = 100;
+vib_amp = 15.0;             
+
+% ----次级---- 4 -0.2
+delay = 4;                  
+s_hat_gain = -0.2;          
+S_est = zeros(delay+1, 1);
+S_est(end) = s_hat_gain;
+
+%% ==================== 3. 实例化复杂物理底座 ====================
+vib_source = VibrationSource();
+structure = StructuralDynamics(fs, 5, true);
+actuator = PiezoActuator();
+actuator.K = 0.85; actuator.fn = 3100; actuator.zeta = 0.023;
+actuator.alpha = 0.15; actuator.beta = 0.035; actuator.gamma = 0.025;
+sensor = Accelerometer(fs);
+sensor.sensitivity = 98; sensor.bandwidth = [0.5, 3000]; sensor.noise_density = 6e-6;
+
+%% ==================== 4. 各维度控制器初始化 ====================
+% --- [维度二] FxLMS 线性底座初始化 ---
+L = 128;                    
+mu_fixed = 5e-7;            
+mu_vss_max = 5e-6;    %5      
+mu_vss_min = 1e-7;          
+w_fxlms = zeros(L,1);
+x_buffer = zeros(L,1);
+xf_buffer = zeros(L,1);
+
+% --- [维度一] 非线性架构初始化 ---
+if MODE == 2
+    % 纯边缘端 FLANN+RNN (无蒸馏)
+    flann_order = 5;            
+    rnn_hidden = 16;            
+    lr_nn = 0.002;              
+    flann_input_dim = 2 + 2 * flann_order; 
+    rng('shuffle'); % 每次运行权重全变
+    W_in2hid = randn(rnn_hidden, flann_input_dim) * 0.1; 
+    W_hid2hid = randn(rnn_hidden, rnn_hidden) * 0.1;
+    W_out = zeros(1, rnn_hidden + 1); 
+    h_state = zeros(rnn_hidden, 1); 
+    err_buffer = zeros(delay + 1, 1);
+    nn_features_buffer = zeros(delay + 1, rnn_hidden + 1); % 特征滤波缓冲池
+    fprintf('>> 架构选择: FLANN+RNN (纯边缘端随机初始化，无先验)\n');
+elseif MODE == 3
+    % 蒸馏 NN 
+    if isfile('trained_nn.mat')
+        S = load('trained_nn.mat');
+        if isfield(S, 'nn'), nn = S.nn; 
+            fprintf('>> 架构选择: 成功加载云端预训练蒸馏模型 trained_nn.mat！\n');
+        else, error('无效的 nn 对象'); 
+        end
+    else, error('缺失 trained_nn.mat'); 
+    end
+end
+
+% --- [维度三] 融合策略调度器初始化 ---
+thd_window = 256;           
+thd_update_interval = 50;   
+alpha_convex = 0.05;        
+rho_gain = 0;   
+w_nn = 0; % 【进化】：替换 rho_gain，升级为全自适应桥接权重
+mu_rho = 2e-5;              
+yn_f_buffer = zeros(delay+1, 1); 
+% 谐波专属参数
+mu_harm = 5e-4;             
+w_harm = zeros(4, 1);       
+x_harm_buffer = zeros(delay+1, 4); 
+
+%% ==================== 5. 预分配数组 ====================
+vibration_raw = zeros(n_samples,1);
+control_signal = zeros(n_samples,1);
+error_signal = zeros(n_samples,1);
+y_linear = zeros(n_samples,1);
+y_nn = zeros(n_samples,1);
+y_harm_history = zeros(n_samples,1); 
+history_factor = zeros(n_samples,1); 
+history_mu = zeros(n_samples,1);     
+% === 云端训练数据日志池 ===
+Feature_Log = zeros(n_samples, 19);
+
+%% ==================== 6. 主仿真循环 ====================
+acc_control = 0;   
+current_phase = 0;
+err_env = 0; % 初始化误差包络记录器
+fprintf('=== 开始仿真 | 架构:%d | 底座:%d | 融合:%d | 环境:%d ===\n', MODE, STEP_MODE, MIX_MODE, EM);
+tic;
+
+for k = 1:n_samples
+    % ---------------------------------------------------------
+    % 模块 A：环境生成
+    % ---------------------------------------------------------
+    if EM == 1 
+        if t(k) < 10, current_f = 80; current_amp = 12.0;
+        elseif t(k) < 20, current_f = 100; current_amp = 15.0;
+        else, current_f = 110; current_amp = 10.0; 
+        end 
+    elseif EM == 2 % 固定模式
+        current_f = 100; current_amp = 15.0;
+    elseif EM == 3 % 线性扫频
+        current_f = 50 + (100 - 50) * (t(k) / duration); current_amp = 15.0;
+    elseif EM == 4 % 正弦调制
+        current_f = 75 + 25 * sin(2 * pi * 0.5 * t(k)); current_amp = 15.0;
+    end
+    
+    current_phase = current_phase + 2 * pi * current_f * dt;
+    chatter_noise = 0.5 * sin(2 * pi * 400 * t(k)) * randn(); 
+    vibration_raw(k) = current_amp * sin(current_phase) ...
+                     + (current_amp * 0.15) * sin(2 * current_phase) ...
+                     + (current_amp * 0.05) * sin(3 * current_phase) ...
+                     + chatter_noise + 0.05 * randn();
+    error_signal(k) = vibration_raw(k) + acc_control;
+    if MODE == 2, err_buffer = [error_signal(k); err_buffer(1:end-1)]; end
+    
+    % ---------------------------------------------------------
+    % 模块 B：[维度二] 线性底座计算与变步长调度
+    % ---------------------------------------------------------
+    x_buffer = [vibration_raw(k); x_buffer(1:end-1)];
+    xf = S_est' * x_buffer(1:length(S_est));
+    xf_buffer = [xf; xf_buffer(1:end-1)];
+    y_linear(k) = w_fxlms' * x_buffer(1:L);
+    
+    % ---------------------------------------------------------
+    % 模块 B：[维度二] 线性底座计算与包络变步长调度
+    % ---------------------------------------------------------
+    x_buffer = [vibration_raw(k); x_buffer(1:end-1)];
+    xf = S_est' * x_buffer(1:length(S_est));
+    xf_buffer = [xf; xf_buffer(1:end-1)];
+    y_linear(k) = w_fxlms' * x_buffer(1:L);
+    
+    % --- 提取宏观误差包络 (重度低通滤波，极其平滑) ---
+    err_env = 0.9995 * err_env + 0.0005 * abs(error_signal(k));
+    
+    % 解耦的步长策略
+    if STEP_MODE == 2
+        % 【防御型平滑 VSS (Defensive VSS)】
+        mu_max_safe = 5e-7; % 稳态巡航步长（此值安全）
+        mu_min_safe = 5e-8; % 突变保命步长（极限龟缩）
+        mu_cold_start = 2.5e-6;
+
+        % 数学逻辑（极度优美）：
+        % 误差越大，exp() 越趋近 0，步长瞬间缩减到 5e-8，把权限让给 NN！
+        % 误差越小，exp() 越趋近 1，步长恢复到 5e-7，维持极高稳态精度！
+        %mu_current = mu_min_safe + (mu_max_safe - mu_min_safe) * exp(-err_env / 2.0);
+        if t(k) < 1.5
+            % [冷启动加速期]：刚开机前 2 秒，没有历史错误权重的包袱，
+            % 直接全速开荒！迅速建立初始线性底座。
+            mu_current = mu_max_safe;
+        else
+            % [稳态防御期]：开机建系完成后，启动防御机制。
+            % 遇到突变时误差变大，步长瞬间缩减到 5e-8，把强攻权限让给神经网络！
+            mu_current = mu_min_safe + (mu_max_safe - mu_min_safe) * exp(-err_env / 2.0);
+        end
+    else
+        mu_current = mu_fixed;
+
+    end
+    history_mu(k) = mu_current;
+
+    
+    % ---------------------------------------------------------
+    % 模块 C：[维度一] 全局特征提取 与 非线性模型推理
+    % ---------------------------------------------------------
+    % 只要 k >= 200，就必须提取并记录特征
+    if k >= 200
+        features = extract_features(vibration_raw, error_signal, control_signal, xf_buffer, k, fs, current_f);
+        Feature_Log(k, :) = features; % 记录当前 19 维特征，供云端炼丹使用
+    else
+        features = zeros(1, 19);
+    end
+
+    % 根据不同模式进行网络前向推理
+    if MODE == 2 % 纯边缘在线模型
+        ref_norm = vibration_raw(k) / 20.0; 
+        err_delayed = err_buffer(end) / 20.0; 
+        phi_expand = [ref_norm; err_delayed];
+        for order = 1:flann_order
+            phi_expand = [phi_expand; sin(order*pi*ref_norm); cos(order*pi*ref_norm)];
+        end
+        h_state = tanh(W_in2hid * phi_expand + W_hid2hid * h_state);
+        nn_features = [h_state; 1]; 
+        y_nn(k) = W_out * nn_features;
+        
+        % 对神经元特征进行次级路径滤波 (FxBP 算法核心)
+        nn_features_buffer = [nn_features'; nn_features_buffer(1:end-1, :)];
+        nn_features_f = (S_est' * nn_features_buffer)'; % 滤波后的特征梯度
+        
+    elseif MODE == 3 % 云端蒸馏模型
+        if k >= 200
+            features = extract_features(vibration_raw, error_signal, control_signal, xf_buffer, k, fs, current_f);
+            Feature_Log(k, :) = features; 
+            
+            if k >= 2000
+                % 【物理降维打击】：修正云端 Target 的 DC 增益谬误！
+                % 将模型输出的标称巨型电压，衰减 50 倍，匹配机床真实的共振放大率。
+                y_nn_raw = nn.forward(features') * 0.02; 
+                
+                % 加入平滑滤波，斩断高频毛刺
+                if k == 2000, y_nn(k) = y_nn_raw;
+                else, y_nn(k) = 0.8 * y_nn(k-1) + 0.2 * y_nn_raw; end
+            else
+                y_nn(k) = 0; 
+            end
+        else
+            y_nn(k) = 0; 
+        end
+    end    
+    % ---------------------------------------------------------
+    % 模块 D：[维度三] 窄带谐波刺客 (仅在 MIX_MODE=2/3 时激活以及HARM_SWITCH = 1;)
+    % ---------------------------------------------------------
+    if (MIX_MODE == 3||MIX_MODE == 2) && (MODE == 2 || MODE == 3) && HARM_SWITCH == 1
+        x_harm = [sin(2 * current_phase); cos(2 * current_phase); ...
+                  sin(3 * current_phase); cos(3 * current_phase)];
+        x_harm_buffer = [x_harm'; x_harm_buffer(1:end-1, :)];
+        xf_harm = (S_est' * x_harm_buffer)'; 
+        y_harm = w_harm' * x_harm;
+    else
+        y_harm = 0; xf_harm = zeros(4,1);
+    end
+    y_harm_history(k) = y_harm;
+
+    % ---------------------------------------------------------
+    % 模块 E：[维度三] 多维消融融合律 (控制权限分配)
+    % ---------------------------------------------------------
+    if mod(k, thd_update_interval) == 0 && k > thd_window
+        err_rms = rms(error_signal(k-thd_window+1 : k)); 
+        if err_rms < 1.0, alpha_convex = 0.01;
+        elseif err_rms < 4.0, alpha_convex = 0.01 + (err_rms - 1.0)/3.0 * 0.49;
+        else, alpha_convex = 0.05; %test 0.2
+        end
+    end
+    
+    if MODE == 1
+        y_total = y_linear(k); % 纯 FxLMS
+    else
+        if MIX_MODE == 1
+            y_total = 0.95 * y_linear(k) + 0.05 * y_nn(k); 
+            history_factor(k) = 0.05;
+        elseif MIX_MODE == 2
+            %y_total = (1 - alpha_convex) * y_linear(k) + alpha_convex * y_nn(k);
+            %history_factor(k) = alpha_convex;
+            y_total = (1 - alpha_convex) * y_linear(k) + alpha_convex * y_nn(k) + y_harm; % 只加这最后一个+y_harm
+            history_factor(k) = alpha_convex;
+        elseif MIX_MODE == 3
+            %y_total = y_linear(k) + rho_gain * y_nn(k) + y_harm;
+            y_total = y_linear(k) + w_nn * y_nn(k) + y_harm;
+            %history_factor(k) = rho_gain;
+            history_factor(k) = w_nn; % 画图用的依然是它
+        end
+    end
+    
+    control_signal(k) = max(min(y_total, 10), -10);
+    
+    % ---------------------------------------------------------
+    % 模块 F：物理执行与权值独立更新
+    % ---------------------------------------------------------
+    [~, actuator_force] = actuator.actuate(control_signal(k), dt);
+    [~, ~] = structure.respond(actuator_force, dt);
+    acc_control = structure.get_acceleration(2);
+    
+    % 1. 线性底座永远在线更新
+    w_fxlms = w_fxlms - mu_current * error_signal(k) * xf_buffer;
+    
+    % 2. 边缘端 FLANN+RNN 在线自适应学习 ( FxBP 算法)
+    if MODE == 2
+       
+        % 【双重梯度陷阱】test
+        %current_mix = 1.0; 
+        
+        % 【核心修复 2：赋予 NN 真正的极限防爆学习率】
+        % 当评估模型错乱、误差飙升时，NN 的学习率必须龟缩到 1e-6 级别！
+        lr_max = 0.002;
+        lr_min = 1e-6; % 之前的防爆底线太高，这里必须死死踩住刹车！
+        %lr_real_dynamic = lr_min + (lr_max - lr_min) * exp(-err_env /
+        %2.0);%test
+        % 误差越大，学习率越高；误差越小，学习率越低
+        lr_real_dynamic = lr_min + (lr_max - lr_min) * (1 - exp(-err_env / 2.0));
+        
+        %W_out = W_out - lr_real_dynamic * error_signal(k) * nn_features_f' * current_mix; 
+        W_out = W_out - lr_real_dynamic * error_signal(k) * nn_features_f' * alpha_convex; 
+        
+        % 维持权重衰减，防止错误梯度累积
+        W_out = W_out * 0.9999; 
+        if HARM_SWITCH == 1
+        % +-0.9999
+        w_harm = 0.9999*w_harm - mu_harm * error_signal(k) * xf_harm;
+        end
+    end
+
+    
+    % 3. 终极组合：更新谐波刺客 & 端云相位桥接权重 w_nn
+    if MIX_MODE == 3 
+        % 谐波刺客（物理正交解耦，永远可以独立工作）
+        if HARM_SWITCH == 1
+            w_harm = w_harm - mu_harm * error_signal(k) * xf_harm;
+        end
+        
+        % 【核心修复 3：专属隔离】动态 w_nn 仅限 MODE=3（云端模型）使用！
+        if MODE == 3
+            yn_f_buffer = [y_nn(k); yn_f_buffer(1:end-1)];
+            y_nn_f = S_est' * yn_f_buffer;
+            
+            if abs(error_signal(k)) > 3.0
+                mu_wnn = 5e-4;
+                forget_factor = 1.0; 
+            else
+                mu_wnn = 1e-5;
+                forget_factor = 0.999; 
+            end
+            
+            w_nn = forget_factor * w_nn - mu_wnn * error_signal(k) * y_nn_f;
+            w_nn = max(min(w_nn, 2.0), -2.0);
+        end
+    end
+
+    if mod(k, fs*5) == 0
+        fprintf('时间: %d s, 当前误差: %.2f m/s2\n', t(k), error_signal(k));
+    end
+end
+sim_time = toc;
+if ta ==1
+    %% ==================== 数据生成与导出 ====================
+    fprintf('\n>> 正在启动云端上帝视角，计算完美 Target...\n');
+
+    % 1. (提前 4 步看未来)，计算绝对完美的总控制电压
+    ideal_y_total = zeros(n_samples, 1);
+    % gain = -0.2, 所以要乘以 -5
+    ideal_y_total(1 : end-delay) = vibration_raw(delay+1 : end) / (-s_hat_gain);
+
+    % 2. 神经网络需要学习的是 FxLMS 搞不定的那部分 (Target)
+    Target_Log = ideal_y_total - y_linear;
+
+    % 3. 截取有效数据段 (切掉前 2000 步的初始化乱码，以及最后几步的未来越界)
+    valid_idx = 2000 : (n_samples - delay - 1);
+
+    % 4. 组装并导出 PyTorch 需要的字典格式
+    data_collect.features = Feature_Log(valid_idx, :);
+    data_collect.targets = Target_Log(valid_idx);
+
+    save('training_data.mat', 'data_collect');
+    fprintf('成功导出 training_data.mat！共包含 %d 条恶劣工况样本。\n', length(valid_idx));
+end
+fprintf('仿真完成，耗时 %.2f 秒\n', sim_time);
+
+%% ==================== 7. 全局战报与出图 ====================
+rms_raw_global = rms(vibration_raw);
+rms_err_global = rms(error_signal);
+reduction_dB_global = 20 * log10(rms_raw_global / rms_err_global);
+
+peak_raw = max(abs(vibration_raw));
+peak_err = max(abs(error_signal));
+rms_err_steady = rms(error_signal(end-fs*2:end));
+
+fprintf('\n========== 终极性能战报 ==========\n');
+fprintf('最大峰值误差 : %.2f m/s2 (原始峰值: %.2f m/s2)\n', peak_err, peak_raw);
+fprintf('全局 RMS 误差: %.4f m/s2\n', rms_err_global);
+fprintf('稳态 RMS 误差: %.4f m/s2 (最后2秒)\n', rms_err_steady);
+fprintf('全局振动抑制比: %.2f dB\n', reduction_dB_global);
+
+figure('Name', '第五章 终极解耦多维度消融测试', 'Position', [100, 100, 1200, 800]);
+
+subplot(3, 1, 1);
+plot(t, vibration_raw, 'Color', [0.7 0.7 0.7]); hold on;
+plot(t, error_signal, 'r', 'LineWidth', 1.2);
+xlabel('时间 (s)'); ylabel('加速度 (m/s^2)');
+title(sprintf('残差对比 (架构:%d, 底座:%d, 融合:%d | 全局: %.1f dB, 稳态: %.2f m/s^2)', ...
+    MODE, STEP_MODE, MIX_MODE, reduction_dB_global, rms_err_steady));
+legend('原始恶劣振动', '残余误差'); grid on;
+
+subplot(3, 1, 2);
+[Pv, f_v] = pwelch(vibration_raw, hamming(1024), 512, 2048, fs);
+[Pe, f_e] = pwelch(error_signal, hamming(1024), 512, 2048, fs);
+semilogy(f_v, Pv, 'Color', [0.7 0.7 0.7]); hold on;
+semilogy(f_e, Pe, 'r', 'LineWidth', 1.2);
+xlabel('频率 (Hz)'); ylabel('PSD'); xlim([0, 800]); grid on;
+
+subplot(3, 1, 3);
+yyaxis left;
+plot(t, history_factor, 'b', 'LineWidth', 1.5);
+ylabel('融合因子 (\alpha 或 \rho)'); ylim([-1.1, 1.1]);
+yyaxis right;
+plot(t, history_mu, 'm--', 'LineWidth', 1);
+ylabel('FxLMS 步长 \mu');
+title('动态调度曲线追踪：步长与融合因子的独立解耦'); grid on; xlabel('时间 (s)');

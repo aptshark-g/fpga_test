@@ -10,7 +10,7 @@ clear; clc; close all;
 % 1: 纯 FxLMS (无非线性补偿)
 % 2: FxLMS + FLANN+RNN (纯边缘端在线学习，无先验暗知识)
 % 3: FxLMS + 蒸馏 NN (加载 trained_nn.mat，具备相位超前预判)
-MODE = 1;       
+MODE = 2;       
 
 % 【维度二：线性底座模式 (FxLMS 步长策略)】
 % 1: 定步长 FxLMS (Fixed Step)
@@ -21,7 +21,7 @@ STEP_MODE = 2;
 % 1: 固定微小比例混合 (0.05 强行写死)
 % 2: 动态凸因子 α (零和博弈跷跷板)
 % 3: 动态非对称混合 ρ (梯度自适应) + 窄带谐波刺客 
-MIX_MODE = 3;   
+MIX_MODE = 2;   
 
 % 【环境工况】
 % 1:多工步突变 2:固定100Hz 3:线性扫频 4:正弦调制
@@ -29,6 +29,11 @@ EM = 1;
 
 % 数据采集
 ta = 0;
+
+% 【维度四：窄带谐波刺客开关】
+% 0: 关闭谐波刺客 (y_harm=0)
+% 1: 开启谐波刺客 (原基准组)
+HARM_SWITCH = 1;  % 做对照实验时仅需改这里为0
 
 %% ==================== 2. 系统与物理环境参数 ====================
 fs = 10000;                 
@@ -39,6 +44,7 @@ t = (0:n_samples-1)' / fs;
 vib_freq = 100;
 vib_amp = 15.0;             
 
+% ----次级---- 4 -0.2
 delay = 4;                  
 s_hat_gain = -0.2;          
 S_est = zeros(delay+1, 1);
@@ -57,7 +63,7 @@ sensor.sensitivity = 98; sensor.bandwidth = [0.5, 3000]; sensor.noise_density = 
 % --- [维度二] FxLMS 线性底座初始化 ---
 L = 128;                    
 mu_fixed = 5e-7;            
-mu_vss_max = 5e-6;          
+mu_vss_max = 5e-5;    %5      
 mu_vss_min = 1e-7;          
 w_fxlms = zeros(L,1);
 x_buffer = zeros(L,1);
@@ -84,15 +90,17 @@ elseif MODE == 3
         S = load('trained_nn.mat');
         if isfield(S, 'nn'), nn = S.nn; 
             fprintf('>> 架构选择: 成功加载云端预训练蒸馏模型 trained_nn.mat！\n');
-        else, error('无效的 nn 对象'); end
-    else, error('缺失 trained_nn.mat'); end
+        else, error('无效的 nn 对象'); 
+        end
+    else, error('缺失 trained_nn.mat'); 
+    end
 end
 
 % --- [维度三] 融合策略调度器初始化 ---
 thd_window = 256;           
 thd_update_interval = 50;   
 alpha_convex = 0.05;        
-%rho_gain = 0;   
+rho_gain = 0;   
 w_nn = 0; % 【进化】：替换 rho_gain，升级为全自适应桥接权重
 mu_rho = 2e-5;              
 yn_f_buffer = zeros(delay+1, 1); 
@@ -240,9 +248,9 @@ for k = 1:n_samples
         end
     end    
     % ---------------------------------------------------------
-    % 模块 D：[维度三] 窄带谐波刺客 (仅在 MIX_MODE=3 时激活)
+    % 模块 D：[维度三] 窄带谐波刺客 (仅在 MIX_MODE=2/3 时激活以及HARM_SWITCH = 1;)
     % ---------------------------------------------------------
-    if MIX_MODE == 3 && (MODE == 2 || MODE == 3)
+    if (MIX_MODE == 3||MIX_MODE == 2) && (MODE == 2 || MODE == 3) && HARM_SWITCH == 1
         x_harm = [sin(2 * current_phase); cos(2 * current_phase); ...
                   sin(3 * current_phase); cos(3 * current_phase)];
         x_harm_buffer = [x_harm'; x_harm_buffer(1:end-1, :)];
@@ -260,7 +268,7 @@ for k = 1:n_samples
         err_rms = rms(error_signal(k-thd_window+1 : k)); 
         if err_rms < 1.0, alpha_convex = 0.01;
         elseif err_rms < 4.0, alpha_convex = 0.01 + (err_rms - 1.0)/3.0 * 0.49;
-        else, alpha_convex = 0.5; 
+        else, alpha_convex = 0.05; %test 0.2
         end
     end
     
@@ -271,7 +279,9 @@ for k = 1:n_samples
             y_total = 0.95 * y_linear(k) + 0.05 * y_nn(k); 
             history_factor(k) = 0.05;
         elseif MIX_MODE == 2
-            y_total = (1 - alpha_convex) * y_linear(k) + alpha_convex * y_nn(k);
+            %y_total = (1 - alpha_convex) * y_linear(k) + alpha_convex * y_nn(k);
+            %history_factor(k) = alpha_convex;
+            y_total = (1 - alpha_convex) * y_linear(k) + alpha_convex * y_nn(k) + y_harm; % 只加这最后一个+y_harm
             history_factor(k) = alpha_convex;
         elseif MIX_MODE == 3
             %y_total = y_linear(k) + rho_gain * y_nn(k) + y_harm;
@@ -295,52 +305,54 @@ for k = 1:n_samples
     
     % 2. 边缘端 FLANN+RNN 在线自适应学习 ( FxBP 算法)
     if MODE == 2
-        % 获取当前神经网络的真实介入比例
-        if MIX_MODE == 1, current_mix = 0.05; 
-        elseif MIX_MODE == 2, current_mix = alpha_convex; 
-        elseif MIX_MODE == 3, current_mix = rho_gain; 
-        else, current_mix = 1; end
+       
+        % 【双重梯度陷阱】test
+        %current_mix = 1.0; 
         
-        % 梯度 = 学习率 * 误差 * 滤波后特征 * 介入比例
-        % 调小学习率，确保冷启动不翻车
-        lr_real = 0.005; 
-        W_out = W_out - lr_real * error_signal(k) * nn_features_f' * current_mix; 
+        % 【核心修复 2：赋予 NN 真正的极限防爆学习率】
+        % 当评估模型错乱、误差飙升时，NN 的学习率必须龟缩到 1e-6 级别！
+        lr_max = 0.002;
+        lr_min = 1e-6; % 之前的防爆底线太高，这里必须死死踩住刹车！
+        %lr_real_dynamic = lr_min + (lr_max - lr_min) * exp(-err_env /
+        %2.0);%test
+        % 误差越大，学习率越高；误差越小，学习率越低
+        lr_real_dynamic = lr_min + (lr_max - lr_min) * (1 - exp(-err_env / 2.0));
         
-        % 引入微小的权重衰减 (Weight Decay)，防止冷启动激增
-        W_out = W_out * 0.9999;
+        %W_out = W_out - lr_real_dynamic * error_signal(k) * nn_features_f' * current_mix; 
+        W_out = W_out - lr_real_dynamic * error_signal(k) * nn_features_f' * alpha_convex; 
+        
+        % 维持权重衰减，防止错误梯度累积
+        W_out = W_out * 0.9999; 
+        if HARM_SWITCH == 1
+        % +-0.9999
+        w_harm = 0.9999*w_harm - mu_harm * error_signal(k) * xf_harm;
+        end
     end
+
     
-    % 3. 终极组合：更新谐波刺客 & 智能梯度调度 ρ
-    if MIX_MODE == 3 && (MODE == 2 || MODE == 3)
-        w_harm = w_harm - mu_harm * error_signal(k) * xf_harm;
-        
-        yn_f_buffer = [y_nn(k); yn_f_buffer(1:end-1)];
-        y_nn_f = S_est' * yn_f_buffer;
-        
-        % 【封印解除】：因为 NN 电压已被物理缩放(0.02)，所以必须大幅调高学习率！
-        % 让蓝线在突变瞬间获得足够的动力“起飞”。
-        if abs(error_signal(k)) > 3.0
-            %mu_rho_dynamic = 2e-4; % 狂暴模式：极速拔枪
-            mu_wnn = 5e-4;
-            forget_factor = 1.0; % 强攻期：全力开火，不退缩
-        else
-            %mu_rho_dynamic = 1e-5; % 巡航模式：安静挂机。
-            mu_wnn = 1e-5;
-            forget_factor = 0.999; % 退隐期：快速衰减归零，把控制权还给 FxLMS
+    % 3. 终极组合：更新谐波刺客 & 端云相位桥接权重 w_nn
+    if MIX_MODE == 3 
+        % 谐波刺客（物理正交解耦，永远可以独立工作）
+        if HARM_SWITCH == 1
+            w_harm = w_harm - mu_harm * error_signal(k) * xf_harm;
         end
         
-        %w_nn = w_nn - mu_wnn * error_signal(k) * y_nn_f;
-        % 带有弹簧回弹机制的自适应律！
-        w_nn = forget_factor * w_nn - mu_wnn * error_signal(k) * y_nn_f;
-        % 【核心解封】：允许权重变为负数！范围放宽至 [-2.0, 2.0]！
-        % 如果云端模型给的相位反了，系统会自动将 w_nn 降到负数，瞬间化敌为友！
-        w_nn = max(min(w_nn, 2.0), -2.0);
-
-        % 稍微调高一点保持系数 (0.9999 -> 0.99995)，让蓝线能在高位多坚挺零点几秒
-        %rho_gain = 0.99995 * rho_gain - mu_rho_dynamic * error_signal(k) * y_nn_f;
-        
-        % 上限开到 0.8，给予绝对的控制权
-        %rho_gain = max(min(rho_gain, 0.8), 0.0); 
+        % 【核心修复 3：专属隔离】动态 w_nn 仅限 MODE=3（云端模型）使用！
+        if MODE == 3
+            yn_f_buffer = [y_nn(k); yn_f_buffer(1:end-1)];
+            y_nn_f = S_est' * yn_f_buffer;
+            
+            if abs(error_signal(k)) > 3.0
+                mu_wnn = 5e-4;
+                forget_factor = 1.0; 
+            else
+                mu_wnn = 1e-5;
+                forget_factor = 0.999; 
+            end
+            
+            w_nn = forget_factor * w_nn - mu_wnn * error_signal(k) * y_nn_f;
+            w_nn = max(min(w_nn, 2.0), -2.0);
+        end
     end
 
     if mod(k, fs*5) == 0
