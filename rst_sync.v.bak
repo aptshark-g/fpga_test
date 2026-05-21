@@ -1,5 +1,3 @@
-// rst_sync.v
-// rst_sync.v
 // 异步复位、同步释放模块
 // 解决异步复位的亚稳态问题，消除全芯片hold违例
 `timescale 1ns / 1ps
@@ -24,4 +22,3 @@ always @(posedge sys_clk or negedge sys_rst_n) begin
 end
 
 endmodule
-

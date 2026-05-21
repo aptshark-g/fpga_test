@@ -1,0 +1,131 @@
+// flann_output.v
+// flann_output.v
+// FLANN输出层模块（修复版）
+// 功能：三角基函数加权和 + NLMS权重在线更新
+// 【修复日志】
+//   1. update_term由wire + generate生成，消除blocking赋值
+//   2. 增加NLMS归一化（使用phi_norm_sq），原代码声明了norm_denom但未参与计算
+//   3. 归一化除法保留，综合时建议替换为乘法+预计算倒数
+`timescale 1ns / 1ps
+
+module flann_output (
+    input           sys_clk,
+    input           sys_rst_n,
+    input           sample_en,
+    input           en,
+    input   signed [15:0] phi [0:6],
+    input   signed [15:0] error_input,
+    input   signed [15:0] mu,
+    output  reg signed [15:0] flann_output
+);
+
+parameter NUM_BASIS = 7;
+
+reg signed [31:0] w_coeff [0:NUM_BASIS-1];
+
+reg signed [47:0] mult_pipe [0:NUM_BASIS-1];
+reg signed [47:0] add_stage1 [0:3];
+reg signed [47:0] add_stage2 [0:1];
+reg signed [47:0] add_stage3;
+reg signed [47:0] fir_acc;
+
+reg signed [31:0] mu_error;
+reg signed [63:0] phi_norm_sq;
+reg signed [31:0] norm_denom;
+
+// update_term由wire + generate生成，消除blocking赋值
+wire signed [63:0] update_term [0:NUM_BASIS-1];
+genvar gi;
+generate
+    for (gi = 0; gi < NUM_BASIS; gi = gi + 1) begin : gen_update
+        assign update_term[gi] = mu_error * phi[gi];  // Q16.16 * Q4.12 = Q20.28
+    end
+endgenerate
+
+reg sample_en_dly1, sample_en_dly2;
+
+integer i;
+
+// 1. 乘法
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < NUM_BASIS; i = i + 1) mult_pipe[i] <= 48'sd0;
+    end
+    else if (sample_en && en) begin
+        for (i = 0; i < NUM_BASIS; i = i + 1) begin
+            mult_pipe[i] <= w_coeff[i] * phi[i];
+        end
+    end
+end
+
+// 2. 二叉树加法
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < 4; i = i + 1) add_stage1[i] <= 48'sd0;
+        for (i = 0; i < 2; i = i + 1) add_stage2[i] <= 48'sd0;
+        add_stage3 <= 48'sd0;
+        fir_acc <= 48'sd0;
+    end
+    else if (sample_en_dly1 && en) begin
+        add_stage1[0] <= mult_pipe[0] + mult_pipe[1];
+        add_stage1[1] <= mult_pipe[2] + mult_pipe[3];
+        add_stage1[2] <= mult_pipe[4] + mult_pipe[5];
+        add_stage1[3] <= mult_pipe[6];
+        add_stage2[0] <= add_stage1[0] + add_stage1[1];
+        add_stage2[1] <= add_stage1[2] + add_stage1[3];
+        add_stage3 <= add_stage2[0] + add_stage2[1];
+        fir_acc <= add_stage3;
+    end
+end
+
+// 3. 输出饱和
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) flann_output <= 16'sd0;
+    else if (sample_en_dly2 && en) begin
+        if (fir_acc > 48'sh0000_7FFF_0000) flann_output <= 16'sh7FFF;
+        else if (fir_acc < -48'sh0000_8000_0000) flann_output <= -16'sh8000;
+        else flann_output <= fir_acc[31:16];
+    end
+    else if (!en) flann_output <= 16'sd0;
+end
+
+// 4. NLMS权重更新（使用wire update_term + 归一化）
+// 【修复】原代码声明了phi_norm_sq和norm_denom但未用于归一化，现为真NLMS
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < NUM_BASIS; i = i + 1) w_coeff[i] <= 32'sd0;
+        mu_error <= 32'sd0;
+        phi_norm_sq <= 64'sd0;
+        norm_denom <= 32'sd4096;
+    end
+    else if (sample_en && en) begin
+        mu_error <= (mu * error_input) >>> 12;  // Q4.12 * Q4.12 = Q8.24; >>>12 = Q16.16
+        // phi_norm_sq: phi(Q4.12)^2 = Q8.24, 累加7项
+        phi_norm_sq <= (phi[0]*phi[0]) + (phi[1]*phi[1]) + (phi[2]*phi[2]) +
+                       (phi[3]*phi[3]) + (phi[4]*phi[4]) + (phi[5]*phi[5]) + (phi[6]*phi[6]);
+        norm_denom <= 32'sd4096;  // epsilon防止除零
+
+        for (i = 0; i < NUM_BASIS; i = i + 1) begin
+            // NLMS: w = w + mu*e*phi / (phi^T*phi + epsilon)
+            // update_term[i] = mu_error * phi[i] = Q20.28
+            // >>> 12 得 Q20.16，再归一化
+            // 【注意】以下除法建议综合时替换为乘法+预计算倒数
+            w_coeff[i] <= w_coeff[i] + $signed(
+                (update_term[i] >>> 12) / ((phi_norm_sq >>> 12) + norm_denom)
+            );
+        end
+    end
+end
+
+// 5. 使能信号打拍
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        sample_en_dly1 <= 1'b0;
+        sample_en_dly2 <= 1'b0;
+    end else begin
+        sample_en_dly1 <= sample_en;
+        sample_en_dly2 <= sample_en_dly1;
+    end
+end
+
+endmodule

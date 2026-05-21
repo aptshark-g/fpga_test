@@ -1,0 +1,193 @@
+// Elman RNN 轻量化循环神经网络模块
+// 功能：隐藏层带状态反馈，输出层权重在线更新
+// 配置：4隐藏神经元，tanh LUT激活，仅输出层可学习
+// 定点格式：输入/隐藏/输出 Q4.12，输出权重 Q16.16，隐藏权重 Q4.12
+// 适用：压电迟滞时序补偿的轻量化记忆模块
+`timescale 1ns / 1ps
+
+module elman_rnn (
+    input           sys_clk,
+    input           sys_rst_n,
+    input           sample_en,
+    input           en,                     // RNN使能
+    input   signed [15:0] x_input,          // 原始输入信号，Q4.12
+    input   signed [15:0] error_input,      // 误差信号，Q4.12
+    input   signed [15:0] mu,               // 学习步长，Q4.12
+    output  reg signed [15:0] rnn_output    // RNN控制输出，Q4.12
+);
+
+// ==================== 参数定义 ====================
+parameter HIDDEN_NUM = 4;                   // 隐藏层神经元数
+parameter NUM_LUT = 256;                    // tanh LUT深度
+
+// ==================== tanh LUT存储器 ====================
+// 256点tanh LUT，16位有符号Q4.12
+// 输入映射：net_h(Q4.12范围[-2,+2]即[-8192,+8192]) → addr[0,255]
+reg signed [15:0] tanh_lut [0:NUM_LUT-1];
+initial begin
+    $readmemh("tanh_lut.hex", tanh_lut);
+end
+
+// ==================== 隐藏层权重（预训练固化，Q4.12）====================
+// 输入→隐藏权重 W_xh
+reg signed [15:0] W_xh [0:HIDDEN_NUM-1];
+// 隐藏→隐藏权重 W_hh
+reg signed [15:0] W_hh [0:HIDDEN_NUM-1][0:HIDDEN_NUM-1];
+// 隐藏偏置 b_h
+reg signed [15:0] b_h [0:HIDDEN_NUM-1];
+// 输出偏置 b_y
+reg signed [15:0] b_y;
+
+// ==================== 输出层权重（在线更新，Q16.16）====================
+reg signed [31:0] W_hy [0:HIDDEN_NUM-1];
+
+// ==================== 隐藏状态 ====================
+reg signed [15:0] h_state [0:HIDDEN_NUM-1];   // Q4.12
+
+// ==================== 组合逻辑中间变量 ====================
+// 隐藏层净输入 net_h = W_xh*x + Σ W_hh*h + b_h，Q8.24
+reg signed [31:0] net_h [0:HIDDEN_NUM-1];
+// tanh LUT地址
+reg [7:0] tanh_addr [0:HIDDEN_NUM-1];
+// 新的隐藏状态（查表后）
+reg signed [15:0] h_new [0:HIDDEN_NUM-1];
+
+// 输出层中间变量
+reg signed [47:0] out_mult [0:HIDDEN_NUM-1];  // W_hy(Q16.16)*h(Q4.12)=Q20.28
+reg signed [47:0] out_acc;                    // 输出累加
+
+// 权重更新中间变量
+reg signed [63:0] grad_raw [0:HIDDEN_NUM-1];  // μ*e*h，Q12.36
+reg signed [31:0] grad_q16 [0:HIDDEN_NUM-1];   // 归一化到Q16.16
+
+integer i, j;
+
+// ==================== 预训练权重初始化（示例值，需替换为实际量化值）====================
+initial begin
+    // W_xh: 输入到各隐藏神经元的小权重
+    W_xh[0] = 16'sd512;     // 0.125
+    W_xh[1] = 16'sd1024;    // 0.25
+    W_xh[2] = 16'sd256;     // 0.0625
+    W_xh[3] = 16'sd768;     // 0.1875
+
+    // W_hh: 自反馈为主，交叉耦合弱
+    for (i = 0; i < HIDDEN_NUM; i = i + 1) begin
+        for (j = 0; j < HIDDEN_NUM; j = j + 1) begin
+            if (i == j)
+                W_hh[i][j] = 16'sh0C00;  // 对角：0.75（自反馈强，记忆性强）
+            else if ((i+1)%HIDDEN_NUM == j)
+                W_hh[i][j] = 16'sd256;   // 相邻耦合：0.0625
+            else
+                W_hh[i][j] = 16'sd64;    // 远距耦合：0.015625
+        end
+    end
+
+    // 偏置
+    b_h[0] = 16'sd0;
+    b_h[1] = 16'sd0;
+    b_h[2] = 16'sd0;
+    b_h[3] = 16'sd0;
+    b_y = 16'sd0;
+
+    // 输出权重：初始化为小随机值
+    W_hy[0] = 32'sh0000_0400;  // 0.015625
+    W_hy[1] = 32'sh0000_0200;  // 0.0078125
+    W_hy[2] = 32'sh0000_0600;  // 0.0234375
+    W_hy[3] = 32'sh0000_0300;  // 0.01171875
+end
+
+// ==================== 1. 隐藏层组合逻辑：net_h计算 + tanh查表 ====================
+always @(*) begin
+    for (i = 0; i < HIDDEN_NUM; i = i + 1) begin
+        // net_h[i] = W_xh[i] * x_input + b_h[i]
+        // Q4.12 * Q4.12 = Q8.24
+        net_h[i] = (W_xh[i] * x_input) + (b_h[i] <<< 12);
+
+        // + Σ_j W_hh[i][j] * h_state[j]
+        for (j = 0; j < HIDDEN_NUM; j = j + 1) begin
+            net_h[i] = net_h[i] + (W_hh[i][j] * h_state[j]);
+        end
+
+        // 将net_h(Q8.24)限制并映射到tanh LUT地址
+        // 步骤：右移12位得Q8.12 → 限制到[-8192, +8192] → 加8192 → 右移6位得[0,255]
+        if ((net_h[i] >>> 12) > 32'sd8192)
+            tanh_addr[i] = 8'd255;
+        else if ((net_h[i] >>> 12) < -32'sd8192)
+            tanh_addr[i] = 8'd0;
+        else
+            tanh_addr[i] = ((net_h[i] >>> 12) + 32'sd8192) >>> 6;
+
+        // tanh查表：输出h_new为Q4.12
+        h_new[i] = tanh_lut[tanh_addr[i]];
+    end
+end
+
+// ==================== 2. 时序：隐藏状态更新 ====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < HIDDEN_NUM; i = i + 1) begin
+            h_state[i] <= 16'sd0;
+        end
+    end
+    else if (sample_en && en) begin
+        for (i = 0; i < HIDDEN_NUM; i = i + 1) begin
+            h_state[i] <= h_new[i];
+        end
+    end
+end
+
+// ==================== 3. 输出层组合逻辑：加权求和 ====================
+always @(*) begin
+    out_acc = 48'sd0;
+    for (i = 0; i < HIDDEN_NUM; i = i + 1) begin
+        // W_hy(Q16.16) * h_state(Q4.12) = Q20.28
+        out_mult[i] = W_hy[i] * h_state[i];
+        out_acc = out_acc + out_mult[i];
+    end
+    // 加偏置：b_y(Q4.12) → Q20.28
+    out_acc = out_acc + ({32'sd0, b_y} <<< 16);
+end
+
+// ==================== 4. 时序：输出锁存 + 饱和 ====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        rnn_output <= 16'sd0;
+    end
+    else if (sample_en && en) begin
+        // out_acc是Q20.28，右移16位得Q4.12
+        if (out_acc > 48'sh0000_7FFF_0000)
+            rnn_output <= 16'sh7FFF;
+        else if (out_acc < -48'sh0000_8000_0000)
+            rnn_output <= -16'sh8000;
+        else
+            rnn_output <= out_acc[31:16];
+    end
+    else if (!en) begin
+        rnn_output <= 16'sd0;
+    end
+end
+
+// ==================== 5. 输出层权重更新（仅W_hy在线更新）====================
+// 更新律：W_hy[i] = W_hy[i] + μ * error * h_state[i]
+// 定点对齐：μ(Q4.12) * error(Q4.12) * h(Q4.12) = Q12.36
+// 右移20位 → Q16.16，与W_hy对齐
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        W_hy[0] <= 32'sh0000_0400;
+        W_hy[1] <= 32'sh0000_0200;
+        W_hy[2] <= 32'sh0000_0600;
+        W_hy[3] <= 32'sh0000_0300;
+    end
+    else if (sample_en && en) begin
+        for (i = 0; i < HIDDEN_NUM; i = i + 1) begin
+            // 梯度计算
+            grad_raw[i] = mu * error_input * h_state[i];  // Q12.36
+            // 归一化到Q16.16
+            grad_q16[i] = grad_raw[i] >>> 20;
+            // 权重更新
+            W_hy[i] <= W_hy[i] + grad_q16[i];
+        end
+    end
+end
+
+endmodule

@@ -1,0 +1,480 @@
+// FLANN三角基函数非线性扩展模块
+// 功能：将输入信号通过三角基函数展开到高维空间，实现非线性映射
+// 展开阶数：3阶（sin(πx), cos(πx), sin(2πx), cos(2πx), sin(3πx), cos(3πx), x）
+// 定点格式：输入/输出/基函数值 Q4.12，权重 Q16.16
+// LUT深度：256点，覆盖[0, 2π)，16位有符号存储 sin(θ)*4096
+`timescale 1ns / 1ps
+
+module flann_basis (
+    input           sys_clk,
+    input           sys_rst_n,
+    input           sample_en,
+    input   signed [15:0] x_input,      // 原始输入信号，Q4.12
+    output  reg signed [15:0] phi [0:6]  // 7个基函数值，Q4.12
+);
+
+// ==================== 参数定义 ====================
+parameter ORDER = 3;                    // 三角展开阶数
+parameter NUM_BASIS = 2*ORDER + 1;      // 基函数总数 = 7
+parameter LUT_DEPTH = 256;            // LUT深度，256点/周期
+parameter LUT_HALF = 128;               // LUT_DEPTH/2 = π位置
+parameter LUT_QTR = 64;                 // LUT_DEPTH/4 = π/2位置
+
+// ==================== LUT存储器 ====================
+// 256点sin LUT，16位有符号Q4.12格式（实际范围±4096对应±1.0）
+reg signed [15:0] sin_lut [0:LUT_DEPTH-1];
+initial begin
+    $readmemh("flann_sin_lut.hex", sin_lut);
+end
+
+// ==================== 内部信号 ====================
+// 输入值扩展（防止乘法溢出）
+wire signed [31:0] x_ext;
+assign x_ext = {{16{x_input[15]}}, x_input};  // 符号扩展至32位
+
+// 各阶三角函数地址计算（组合逻辑，可流水线化）
+// 公式：addr = ((x * k) >>> 5) & 0xFF
+// 解释：Q4.12的x，周期2对应LUT_DEPTH=256，缩放因子=256/(2*4096)=1/32
+reg signed [31:0] x_k [1:3];    // x * k，k=1,2,3
+reg [7:0] sin_addr [1:3];       // sin(kπx)的LUT地址
+reg [7:0] cos_addr [1:3];       // cos(kπx)的LUT地址（sin地址 + π/2偏移）
+
+integer k;
+
+// ==================== 组合逻辑：地址计算 ====================
+always @(*) begin
+    for (k = 1; k <= 3; k = k + 1) begin
+        // x * k，32位有符号
+        x_k[k] = x_ext * k;
+        // 算术右移5位（等价于除以32），取低8位作为LUT地址
+        sin_addr[k] = x_k[k][12:5];  // 取bit[12:5]，覆盖±4个周期
+        // cos地址 = sin地址 + π/2偏移（LUT_DEPTH/4 = 64）
+        cos_addr[k] = sin_addr[k] + LUT_QTR;
+    end
+end
+
+// ==================== 时序逻辑：基函数输出 ====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (k = 0; k < NUM_BASIS; k = k + 1) begin
+            phi[k] <= 16'sd0;
+        end
+    end
+    else if (sample_en) begin
+        // phi[0] = sin(πx)
+        phi[0] <= sin_lut[sin_addr[1]];
+        // phi[1] = cos(πx) = sin(πx + π/2)
+        phi[1] <= sin_lut[cos_addr[1]];
+        // phi[2] = sin(2πx)
+        phi[2] <= sin_lut[sin_addr[2]];
+        // phi[3] = cos(2πx)
+        phi[3] <= sin_lut[cos_addr[2]];
+        // phi[4] = sin(3πx)
+        phi[4] <= sin_lut[sin_addr[3]];
+        // phi[5] = cos(3πx)
+        phi[5] <= sin_lut[cos_addr[3]];
+        // phi[6] = x（线性直通项）
+        phi[6] <= x_input;
+    end
+end
+
+endmodule
+
+
+// FLANN输出层加权和权重更新模块
+// 功能：计算 y = Σ w_i * φ_i(x)，并执行NLMS权重更新
+// 权重更新：w(n+1) = w(n) + μ * e(n) * φ(n) / (||φ||² + ε)
+`timescale 1ns / 1ps
+
+module flann_output (
+    input           sys_clk,
+    input           sys_rst_n,
+    input           sample_en,
+    input           en,                     // FLANN使能
+    input   signed [15:0] phi [0:6],        // 基函数值，Q4.12
+    input   signed [15:0] error_input,      // 误差信号，Q4.12
+    input   signed [15:0] mu,               // 步长因子，Q4.12（实际用小数如0.5→2048）
+    output  reg signed [15:0] flann_output  // FLANN控制输出，Q4.12
+);
+
+// ==================== 参数定义 ====================
+parameter NUM_BASIS = 7;                // 基函数数量
+parameter EPSILON = 32'd4096;           // 正则化参数 ε = 1.0（Q4.12→Q16.16需扩展）
+
+// ==================== 内部信号 ====================
+// 权重系数，Q16.16格式，32位有符号
+reg signed [31:0] w_coeff [0:NUM_BASIS-1];
+
+// 乘法流水线：w_i * φ_i
+reg signed [47:0] mult_pipe [0:NUM_BASIS-1];  // Q16.16 * Q4.12 = Q20.28
+
+// 二叉树加法累加（7个输入→4→2→1）
+reg signed [47:0] add_stage1 [0:3];     // 7→4（最后一个留0）
+reg signed [47:0] add_stage2 [0:1];     // 4→2
+reg signed [47:0] add_stage3;           // 2→1
+reg signed [47:0] fir_acc;              // 最终累加值
+
+// 归一化分母 ||φ||² + ε
+reg signed [63:0] phi_norm_sq;          // Q8.24，基函数平方和
+reg signed [31:0] norm_denom;           // 归一化分母 Q16.16
+
+// 权重更新中间变量
+reg signed [31:0] mu_error;             // μ * e，Q16.16 * Q4.12 → 需对齐
+reg signed [63:0] update_term [0:NUM_BASIS-1];  // 更新项
+
+// 使能信号打拍，同步流水线
+reg sample_en_dly1, sample_en_dly2, sample_en_dly3;
+
+integer i;
+
+// ==================== 1. 乘法流水线：w_i * φ_i ====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < NUM_BASIS; i = i + 1) begin
+            mult_pipe[i] <= 48'sd0;
+        end
+    end
+    else if (sample_en && en) begin
+        for (i = 0; i < NUM_BASIS; i = i + 1) begin
+            // Q16.16 * Q4.12 = Q20.28，结果在48位中
+            mult_pipe[i] <= w_coeff[i] * phi[i];
+        end
+    end
+end
+
+// ==================== 2. 二叉树加法累加（7→4→2→1）====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < 4; i = i + 1) add_stage1[i] <= 48'sd0;
+        for (i = 0; i < 2; i = i + 1) add_stage2[i] <= 48'sd0;
+        add_stage3 <= 48'sd0;
+        fir_acc <= 48'sd0;
+    end
+    else if (sample_en_dly1 && en) begin
+        // Stage1: 7→4（最后一对用0补齐）
+        add_stage1[0] <= mult_pipe[0] + mult_pipe[1];
+        add_stage1[1] <= mult_pipe[2] + mult_pipe[3];
+        add_stage1[2] <= mult_pipe[4] + mult_pipe[5];
+        add_stage1[3] <= mult_pipe[6];  // 单个，无配对
+
+        // Stage2: 4→2
+        add_stage2[0] <= add_stage1[0] + add_stage1[1];
+        add_stage2[1] <= add_stage1[2] + add_stage1[3];
+
+        // Stage3: 2→1
+        add_stage3 <= add_stage2[0] + add_stage2[1];
+
+        // 最终累加（右移16位将Q20.28转为Q4.12）
+        fir_acc <= add_stage3;
+    end
+end
+
+// ==================== 3. 输出饱和处理 ====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        flann_output <= 16'sd0;
+    end
+    else if (sample_en_dly2 && en) begin
+        // fir_acc是Q20.28，右移16位得Q4.12
+        if (fir_acc > 48'sh0000_7FFF_0000)
+            flann_output <= 16'sh7FFF;
+        else if (fir_acc < -48'sh0000_8000_0000)
+            flann_output <= -16'sh8000;
+        else
+            flann_output <= fir_acc[31:16];  // 取Q4.12部分
+    end
+    else if (!en) begin
+        flann_output <= 16'sd0;
+    end
+end
+
+// ==================== 4. NLMS权重更新 ====================
+// 计算 ||φ||² = Σ φ_i²
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        phi_norm_sq <= 64'sd0;
+    end
+    else if (sample_en && en) begin
+        // Q4.12 * Q4.12 = Q8.24，累加后仍为Q8.24量级
+        phi_norm_sq <= (phi[0]*phi[0]) + (phi[1]*phi[1]) + (phi[2]*phi[2]) +
+                       (phi[3]*phi[3]) + (phi[4]*phi[4]) + (phi[5]*phi[5]) +
+                       (phi[6]*phi[6]);
+    end
+end
+
+// 归一化分母：||φ||² + ε（将ε扩展到Q8.24）
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        norm_denom <= 32'sd0;
+    end
+    else if (sample_en && en) begin
+        // EPSILON是Q4.12=4096，扩展到Q8.24需左移12位→4096*4096=16777216
+        // 但phi_norm_sq是64位，这里简化为：norm_denom = (phi_norm_sq >> 12) + 4096
+        // 实际更精确的归一化需要除法，此处用简化版NLMS（固定小步长）
+        norm_denom <= 32'sd4096;  // 简化：固定归一化因子 = 1.0
+    end
+end
+
+// 权重更新（简化版LMS：w = w + μ * e * φ）
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        for (i = 0; i < NUM_BASIS; i = i + 1) begin
+            w_coeff[i] <= 32'sd0;
+        end
+    end
+    else if (sample_en && en) begin
+        // μ(Q4.12) * error(Q4.12) = Q8.24，再右移12位得Q16.16
+        mu_error <= (mu * error_input) >>> 12;
+
+        for (i = 0; i < NUM_BASIS; i = i + 1) begin
+            // update = μ_error(Q16.16) * phi_i(Q4.12) = Q20.28
+            // 右移12位得Q16.16，与w_coeff对齐
+            update_term[i] = mu_error * phi[i];
+            w_coeff[i] <= w_coeff[i] + (update_term[i] >>> 12);
+        end
+    end
+end
+
+// ==================== 5. 使能信号打拍 ====================
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        sample_en_dly1 <= 1'b0;
+        sample_en_dly2 <= 1'b0;
+    end
+    else begin
+        sample_en_dly1 <= sample_en;
+        sample_en_dly2 <= sample_en_dly1;
+    end
+end
+
+endmodule
+
+
+// FLANN顶层集成模块
+// 将flann_basis和flann_output级联，提供统一接口
+`timescale 1ns / 1ps
+
+module flann_top (
+    input           sys_clk,
+    input           sys_rst_n,
+    input           sample_en,
+    input           en,                     // FLANN使能
+    input   signed [15:0] x_input,          // 原始输入信号，Q4.12
+    input   signed [15:0] error_input,      // 误差信号，Q4.12
+    input   signed [15:0] mu,               // 学习步长，Q4.12
+    output  signed [15:0] flann_output      // FLANN控制输出，Q4.12
+);
+
+// 内部连线
+wire signed [15:0] phi [0:6];
+
+// ==================== 基函数生成 ====================
+flann_basis u_flann_basis (
+    .sys_clk    (sys_clk),
+    .sys_rst_n  (sys_rst_n),
+    .sample_en  (sample_en),
+    .x_input    (x_input),
+    .phi        (phi)
+);
+
+// ==================== 输出层加权和更新 ====================
+flann_output u_flann_output (
+    .sys_clk        (sys_clk),
+    .sys_rst_n      (sys_rst_n),
+    .sample_en      (sample_en),
+    .en             (en),
+    .phi            (phi),
+    .error_input    (error_input),
+    .mu             (mu),
+    .flann_output   (flann_output)
+);
+
+endmodule
+
+
+// 更新后的FPGA顶层模块（含FLANN并联架构）
+// 在原有fxlms_core + harmonic_suppress基础上，增加FLANN非线性补偿支路
+`timescale 1ns / 1ps
+
+module fpga_v2 (
+    // 系统时钟与复位
+    input           sys_clk,
+    input           sys_rst_n,
+    // ADC采集接口
+    input   [15:0]  adc_data,
+    input           adc_data_valid,
+    // DAC输出接口
+    output  [15:0]  dac_data,
+    output          dac_data_valid,
+    // 模式配置
+    input           step_mode_sel,      // 0=定步长，1=变步长
+    input           harm_suppress_en,   // 谐波抑制使能
+    input           flann_en,           // FLANN使能（新增）
+    input   [1:0]   mix_mode            // 混合模式：0=仅FxLMS，1=仅FLANN，2=并联和，3=自适应加权
+);
+
+// ==================== 内部信号 ====================
+wire                sys_clk_global;
+wire                pll_locked;
+wire                sys_rst_n_sync;
+wire                sample_en;
+wire signed [15:0]  vib_raw;
+wire signed [15:0]  error_signal;
+wire signed [15:0]  xf_signal;
+wire signed [15:0]  fxlms_output;
+wire signed [15:0]  harm_output;
+wire signed [15:0]  flann_output;       // FLANN输出（新增）
+wire signed [15:0]  mix_output;         // 混合控制输出
+wire signed [15:0]  control_total;
+
+// 自适应混合权重（新增）
+reg  signed [15:0]  rho;                // 线性支路权重，Q4.12（0~1对应0~4096）
+reg  signed [15:0]  nl_score;             // 非线性评分
+
+// ==================== 模块例化（原有模块保留）====================
+// 复位同步
+rst_sync u_rst_sync (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n),
+    .sys_rst_n_sync (sys_rst_n_sync)
+);
+
+// 时钟管理
+clk_pll u_clk_pll (
+    .sys_clk_in     (sys_clk),
+    .sys_rst_n      (sys_rst_n),
+    .sys_clk        (sys_clk_global),
+    .pll_locked     (pll_locked),
+    .sample_en      (sample_en)
+);
+
+// ADC接口
+adc_interface u_adc_interface (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .adc_data       (adc_data),
+    .adc_data_valid (adc_data_valid),
+    .sample_en      (sample_en),
+    .dac_data       (control_total),
+    .vib_raw        (vib_raw),
+    .error_signal   (error_signal)
+);
+
+// 次级路径滤波
+s_hat_filter u_s_hat_filter (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .x_input        (vib_raw),
+    .xf_output      (xf_signal)
+);
+
+// FxLMS核心
+fxlms_core u_fxlms_core (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .x_input        (vib_raw),
+    .xf_input       (xf_signal),
+    .error_input    (error_signal),
+    .step_mode_sel  (step_mode_sel),
+    .fxlms_output   (fxlms_output)
+);
+
+// 谐波抑制
+harmonic_suppress u_harmonic_suppress (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .en             (harm_suppress_en),
+    .current_phase  (vib_raw[15:0]),
+    .error_input    (error_signal),
+    .xf_input       (xf_signal),
+    .harm_output    (harm_output)
+);
+
+// ==================== FLANN模块例化（新增）====================
+flann_top u_flann_top (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .en             (flann_en),
+    .x_input        (vib_raw),
+    .error_input    (error_signal),
+    .mu             (16'sd2048),       // 默认步长0.5（Q4.12）
+    .flann_output   (flann_output)
+);
+
+// ==================== 混合控制策略（新增）====================
+// mix_mode选择：
+// 0 = 仅FxLMS（传统模式）
+// 1 = 仅FLANN（纯非线性）
+// 2 = 并联和（简单相加）
+// 3 = 自适应加权（rho动态调整）
+
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if (!sys_rst_n) begin
+        rho <= 16'sh3000;  // 默认rho=0.75（Q4.12: 3072/4096≈0.75）
+        nl_score <= 16'sd0;
+    end
+    else if (sample_en) begin
+        case (mix_mode)
+            2'b00: begin  // 仅FxLMS
+                rho <= 16'sh1000;  // rho=1.0
+            end
+            2'b01: begin  // 仅FLANN
+                rho <= 16'sd0;     // rho=0
+            end
+            2'b10: begin  // 并联和（rho=0.5，简单平均）
+                rho <= 16'sh0800;  // rho=0.5
+            end
+            2'b11: begin  // 自适应加权（简化版）
+                // 根据误差绝对值动态调整：误差大→FxLMS主导，误差小→FLANN主导
+                if (error_signal[15])  // 负数
+                    nl_score <= -error_signal;
+                else
+                    nl_score <= error_signal;
+
+                // 简单阈值逻辑：大误差rho高，小误差rho低
+                if (nl_score > 16'sd2048)       // |e| > 0.5
+                    rho <= 16'sh0E00;           // rho ≈ 0.875
+                else if (nl_score > 16'sd1024)   // |e| > 0.25
+                    rho <= 16'sh0A00;           // rho ≈ 0.625
+                else
+                    rho <= 16'sh0600;           // rho ≈ 0.375
+            end
+        endcase
+    end
+end
+
+// 混合输出计算：y = rho * y_L + (1-rho) * y_NL
+// Q4.12格式：rho=0~4096，(4096-rho)=补码计算
+wire signed [31:0] mix_lin  = rho * fxlms_output;           // Q4.12 * Q4.12 = Q8.24
+wire signed [31:0] mix_nlin = (16'sd4096 - rho) * flann_output;  // (1-rho) * y_NL
+wire signed [31:0] mix_sum  = mix_lin + mix_nlin;             // Q8.24
+wire signed [15:0] mix_sat;
+
+// 饱和处理
+assign mix_sat = (mix_sum > 32'sh007FFF00) ? 16'sh7FFF :
+                 (mix_sum < -32'sh00800000) ? -16'sh8000 :
+                 mix_sum[23:8];  // Q8.24 → Q4.12，右移12位取高16位
+
+// 输出选择
+assign mix_output = (mix_mode == 2'b00) ? fxlms_output :
+                    (mix_mode == 2'b01) ? flann_output :
+                    mix_sat;
+
+// 总控制输出 = FxLMS + 谐波抑制 + FLANN混合
+assign control_total = mix_output + harm_output;
+
+// DAC输出
+dac_interface u_dac_interface (
+    .sys_clk        (sys_clk_global),
+    .sys_rst_n      (sys_rst_n_sync),
+    .sample_en      (sample_en),
+    .control_input  (control_total),
+    .dac_data       (dac_data),
+    .dac_data_valid (dac_data_valid)
+);
+
+endmodule

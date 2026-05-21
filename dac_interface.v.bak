@@ -1,5 +1,3 @@
-// dac_interface.v
-// dac_interface.v
 // DAC输出接口模块
 // 功能：控制信号限幅、格式转换，输出到DAC芯片
 `timescale 1ns / 1ps
@@ -14,9 +12,8 @@ module dac_interface(
 );
 
 // 输出限幅：±10V对应DAC满量程±32767
-parameter signed [15:0] DAC_MAX = 16'sd32767;
-// 【修复】DAC_MIN显式声明signed，避免无符号比较导致逻辑错误
-parameter signed [15:0] DAC_MIN = 16'sh8000;  // 16位有符号数-32768的补码
+parameter   DAC_MAX = 16'sd32767;
+parameter   DAC_MIN = 16'sd-32768;
 
 always @(posedge sys_clk or negedge sys_rst_n) begin
     if(!sys_rst_n) begin
@@ -42,4 +39,3 @@ always @(posedge sys_clk or negedge sys_rst_n) begin
 end
 
 endmodule
-

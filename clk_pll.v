@@ -1,4 +1,7 @@
+// clk_pll.v
+// clk_pll.v
 // 时钟管理模块：PLL全局时钟+10kHz采样使能生成
+// 【修复】sys_rst_n接入外部异步复位，建议后续改为接入sys_rst_n_sync以统一复位释放时刻
 `timescale 1ns / 1ps
 
 module clk_pll(
@@ -22,7 +25,7 @@ clk_pll_ip u_clk_pll_ip(
 parameter   DIV_CNT_MAX = 16'd4999;
 reg [15:0]  div_cnt;
 
-// 【修复】异步复位、同步使能的规范写法
+// 异步复位、同步使能的规范写法
 always @(posedge sys_clk or negedge sys_rst_n) begin
     // 1. 仅异步复位信号触发复位
     if(!sys_rst_n) begin

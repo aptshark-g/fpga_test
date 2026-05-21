@@ -1,0 +1,4 @@
+create_clock -name sys_clk -period 20 [get_ports sys_clk]
+set_input_delay -clock sys_clk -max 2 [get_ports adc_data*]
+set_output_delay -clock sys_clk -max 2 [get_ports dac_data*]
+set_multicycle_path -setup 2 -from [get_regs *sample_en*] -to [get_regs *fxlms_output*]

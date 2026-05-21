@@ -1,0 +1,32 @@
+// 时钟管理模块：生成10kHz采样使能信号
+`timescale 1ns / 1ps
+
+module clk_pll(
+    input           sys_clk,
+    input           sys_rst_n,
+    output  reg     sample_en   // 10kHz采样使能，单时钟周期高脉冲
+);
+
+// 50MHz系统时钟 → 10kHz，分频系数5000
+parameter   DIV_CNT_MAX = 16'd4999;
+reg [15:0]  div_cnt;
+
+// 分频计数器
+always @(posedge sys_clk or negedge sys_rst_n) begin
+    if(!sys_rst_n) begin
+        div_cnt <= 16'd0;
+        sample_en <= 1'b0;
+    end
+    else begin
+        if(div_cnt == DIV_CNT_MAX) begin
+            div_cnt <= 16'd0;
+            sample_en <= 1'b1;
+        end
+        else begin
+            div_cnt <= div_cnt + 16'd1;
+            sample_en <= 1'b0;
+        end
+    end
+end
+
+endmodule

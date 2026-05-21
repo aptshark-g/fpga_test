@@ -1,5 +1,3 @@
-// adc_interface.v
-// adc_interface.v
 // ADC接口与位宽转换模块
 // 功能：ADC原始数据转Q4.12定点数，误差信号计算（振动+控制反馈）
 `timescale 1ns / 1ps
@@ -10,7 +8,6 @@ module adc_interface(
     input   [15:0]  adc_data,
     input           adc_data_valid,
     input           sample_en,
-    input   signed [15:0] dac_data,  // DAC控制信号输入（反馈用）
     output  reg signed [15:0] vib_raw,
     output  reg signed [15:0] error_signal
 );
@@ -18,8 +15,7 @@ module adc_interface(
 // 内部信号：控制反馈延迟（匹配次级路径4拍延迟）
 reg signed [15:0]  control_feedback [3:0];
 wire signed [15:0] acc_control; // 作动器控制反馈加速度
-// 【修复】参数显式声明signed，避免无符号比较错误
-parameter signed [15:0] S_GAIN = 16'sd819; // 次级路径增益-0.2，Q4.12量化值：-0.2*4096 = -819
+parameter   S_GAIN = 16'sd819; // 次级路径增益-0.2，Q4.12量化值：-0.2*4096 = -819
 
 // 振动信号采样与位宽转换
 always @(posedge sys_clk or negedge sys_rst_n) begin
